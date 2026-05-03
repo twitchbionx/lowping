@@ -1,0 +1,12 @@
+# lowping client config — Phase 1 round-trip smoke test
+# Routes any TCP connection to localhost:9000 through the Dallas bridge,
+# then on to Cloudflare's 1.1.1.1:80.
+
+[[rules]]
+listen = "127.0.0.1:9000"
+bridge = "149.28.240.106:52820"
+bridge_x25519_pubkey_hex = "c220611a272585eeb1f99ee083db3c6229b3c3155f60bedab7d2acba3b87960e"
+license_token = "AAAAAQAAAABp96daAAAAAGoA4doAAAABbnHfDL75-TgvLVmjdxU-WuXzwgwkaRKkMVOOvkcU4aALjNW_yd-UM15vcHtMYERCtr99fuJ809u-K42w9oQNAQ"
+dest_ip = "1.1.1.1"
+dest_port = 80
+protocol = "tcp"

@@ -1,7 +1,6 @@
 //! UDP server: the bridge's main loop.
 
 use anyhow::{Context, Result};
-use chacha20poly1305::Key as AeadKey;
 use chrono::Utc;
 use ed25519_dalek::VerifyingKey;
 use gr_protocol::{
@@ -15,20 +14,29 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedReadHalf;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use x25519_dalek::StaticSecret;
 
 use crate::config::BridgeConfig;
-use crate::session::{DestSocket, DownstreamPacket, Session, SessionKey};
+use crate::session::{DestWriter, Session, SessionKey};
 
-/// Shared bridge state: the session table + counter.
+enum DestReader {
+    Tcp(OwnedReadHalf),
+    Udp(Arc<UdpSocket>),
+}
+
+pub struct DownstreamPacket {
+    pub session_key: SessionKey,
+    pub payload: Vec<u8>,
+}
+
 struct BridgeState {
     sessions: RwLock<HashMap<SessionKey, Arc<tokio::sync::Mutex<Session>>>>,
     config: BridgeConfig,
     bridge_secret: StaticSecret,
     backend_pubkey: VerifyingKey,
-    /// Outbound channel: anyone can submit a packet to be encrypted + sent back to a client.
     downstream_tx: mpsc::UnboundedSender<DownstreamPacket>,
 }
 
@@ -53,21 +61,16 @@ pub async fn run(cfg: BridgeConfig) -> Result<()> {
         downstream_tx,
     });
 
-    // Spawn the downstream sender — drains the channel and writes encrypted
-    // frames back to clients via the listening UDP socket.
     {
         let state = state.clone();
         let socket = socket.clone();
         tokio::spawn(downstream_sender(state, socket, downstream_rx));
     }
-
-    // Spawn the idle reaper — periodically drops sessions with no traffic.
     {
         let state = state.clone();
         tokio::spawn(idle_reaper(state));
     }
 
-    // Main receive loop.
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let (n, peer) = match socket.recv_from(&mut buf).await {
@@ -79,7 +82,6 @@ pub async fn run(cfg: BridgeConfig) -> Result<()> {
         };
         let pkt = buf[..n].to_vec();
         let state = state.clone();
-        // Each packet handled in its own task — a slow handshake doesn't block the listener.
         tokio::spawn(async move {
             if let Err(e) = handle_packet(state, peer, pkt).await {
                 tracing::debug!(peer = %peer, error = ?e, "drop packet");
@@ -89,7 +91,6 @@ pub async fn run(cfg: BridgeConfig) -> Result<()> {
 }
 
 async fn handle_packet(state: Arc<BridgeState>, peer: SocketAddr, pkt: Vec<u8>) -> Result<()> {
-    // Parse the header alone first (no decryption needed for routing).
     let header = Header::decode(&pkt).context("header decode")?;
     if header.version != PROTO_VERSION {
         anyhow::bail!("bad proto version: {}", header.version);
@@ -97,7 +98,7 @@ async fn handle_packet(state: Arc<BridgeState>, peer: SocketAddr, pkt: Vec<u8>) 
     let key = SessionKey { client_addr: peer, connection_id: header.connection_id };
 
     if header.flags.contains(Flags::SYN) {
-        accept_new_session(state, key, header, pkt).await
+        accept_new_session(state, key, pkt).await
     } else {
         forward_data(state, key, pkt).await
     }
@@ -106,10 +107,8 @@ async fn handle_packet(state: Arc<BridgeState>, peer: SocketAddr, pkt: Vec<u8>) 
 async fn accept_new_session(
     state: Arc<BridgeState>,
     key: SessionKey,
-    header: Header,
     pkt: Vec<u8>,
 ) -> Result<()> {
-    // Refuse if at capacity.
     if state.sessions.read().len() >= state.config.max_sessions {
         anyhow::bail!("session table full");
     }
@@ -119,7 +118,6 @@ async fn accept_new_session(
     let aead_key = handshake::bridge_derive_session_key(&state.bridge_secret, &client_pk);
     let inner = decrypt_syn_payload(&aead_key, &pkt)?;
 
-    // Inner SYN payload format: [88-byte license token][ConnectRequest...]
     if inner.len() < gr_protocol::license::TOKEN_LEN + 4 {
         anyhow::bail!("SYN payload too short for token + connect");
     }
@@ -138,24 +136,19 @@ async fn accept_new_session(
         "accepting session"
     );
 
-    // Open the destination socket.
-    let dest = open_dest(&connect).await?;
+    let (writer, reader) = open_dest(&connect).await?;
 
-    let session = Session::new(key, aead_key, dest);
-    let session = Arc::new(tokio::sync::Mutex::new(session));
-    state.sessions.write().insert(key, session.clone());
+    let session = Arc::new(tokio::sync::Mutex::new(Session::new(aead_key, writer)));
+    state.sessions.write().insert(key, session);
 
-    // Spawn the dest→client forwarder.
+    // Spawn the dest→client forwarder. Uses the OWNED read half — no lock contention.
     let state2 = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = drain_dest(state2, key, session).await {
+        if let Err(e) = drain_dest(state2, key, reader).await {
             tracing::debug!(?key, error = ?e, "session ended");
         }
     });
 
-    // The SYN frame's payload doesn't carry game data — it only carries the
-    // CONNECT. We don't write anything to the dest socket from the SYN.
-    let _ = header; // silence unused
     Ok(())
 }
 
@@ -167,57 +160,40 @@ async fn forward_data(state: Arc<BridgeState>, key: SessionKey, pkt: Vec<u8>) ->
     let mut sess = session.lock().await;
     let (_h, payload) = decrypt_frame(&sess.aead_key, &pkt)?;
     sess.last_active = std::time::Instant::now();
+    let len = payload.len();
 
-    match &mut sess.dest {
-        DestSocket::Tcp(stream) => {
+    match &mut sess.dest_writer {
+        DestWriter::Tcp(stream) => {
             stream.write_all(&payload).await.context("tcp write")?;
         }
-        DestSocket::Udp(udp) => {
+        DestWriter::Udp(udp) => {
             udp.send(&payload).await.context("udp send")?;
         }
     }
+    tracing::trace!(?key, bytes = len, "forwarded to dest");
     Ok(())
 }
 
-/// Per-session task: read from destination socket, encrypt + send back to client.
+/// Per-session task: read from destination, queue back to the client.
+/// Does NOT touch the session mutex — that's why we own a separate read half.
 async fn drain_dest(
     state: Arc<BridgeState>,
     key: SessionKey,
-    session: Arc<tokio::sync::Mutex<Session>>,
+    mut reader: DestReader,
 ) -> Result<()> {
-    // Move the dest socket OUT of the Session so we can read in this task
-    // without holding the Mutex across await points (which would block
-    // other forward_data calls).
-    //
-    // Phase 1 trick: we keep the socket in the session for writes from
-    // forward_data, but create a separate read half for reads. For TCP we
-    // can split. For UDP we can't really (single-buffer socket), so we
-    // serialize via the session lock with a small buffer per recv.
-
+    let mut buf = vec![0u8; MAX_PAYLOAD_LEN];
     loop {
-        let mut buf = vec![0u8; MAX_PAYLOAD_LEN];
-        let n = {
-            let mut sess = session.lock().await;
-            match &mut sess.dest {
-                DestSocket::Tcp(stream) => {
-                    // Brief lock — read available bytes
-                    match tokio::time::timeout(Duration::from_secs(60), stream.read(&mut buf)).await {
-                        Ok(Ok(0)) => return Ok(()), // EOF
-                        Ok(Ok(n)) => n,
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(_) => continue, // timeout, loop and check session validity
-                    }
-                }
-                DestSocket::Udp(udp) => {
-                    match tokio::time::timeout(Duration::from_secs(60), udp.recv(&mut buf)).await {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(_) => continue,
-                    }
-                }
-            }
+        let n = match &mut reader {
+            DestReader::Tcp(r) => match r.read(&mut buf).await {
+                Ok(0) => return Ok(()),
+                Ok(n) => n,
+                Err(e) => return Err(e.into()),
+            },
+            DestReader::Udp(udp) => match udp.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => return Err(e.into()),
+            },
         };
-        // Hand off to the downstream sender (which holds the UDP listening socket).
         let _ = state.downstream_tx.send(DownstreamPacket {
             session_key: key,
             payload: buf[..n].to_vec(),
@@ -235,7 +211,7 @@ async fn downstream_sender(
             Some(s) => s,
             None => continue,
         };
-        let (header, wire) = {
+        let wire = {
             let mut sess = session.lock().await;
             sess.tx_sequence = sess.tx_sequence.wrapping_add(1);
             let header = Header {
@@ -244,19 +220,17 @@ async fn downstream_sender(
                 connection_id: pkt.session_key.connection_id,
                 sequence: sess.tx_sequence,
             };
-            let wire = match encrypt_frame(&sess.aead_key, &header, &pkt.payload) {
+            match encrypt_frame(&sess.aead_key, &header, &pkt.payload) {
                 Ok(w) => w,
                 Err(e) => {
                     tracing::warn!(error = %e, "encrypt failed");
                     continue;
                 }
-            };
-            (header, wire)
+            }
         };
         if let Err(e) = socket.send_to(&wire, pkt.session_key.client_addr).await {
             tracing::warn!(error = %e, "downstream send failed");
         }
-        let _ = header;
     }
 }
 
@@ -268,7 +242,6 @@ async fn idle_reaper(state: Arc<BridgeState>) {
             - Duration::from_secs(state.config.idle_timeout_secs);
         let mut to_drop = Vec::new();
         for (key, sess) in state.sessions.read().iter() {
-            // Try to acquire without blocking — if locked, it's active anyway
             if let Ok(s) = sess.try_lock() {
                 if s.last_active < cutoff {
                     to_drop.push(*key);
@@ -285,7 +258,7 @@ async fn idle_reaper(state: Arc<BridgeState>) {
     }
 }
 
-async fn open_dest(connect: &ConnectRequest) -> Result<DestSocket> {
+async fn open_dest(connect: &ConnectRequest) -> Result<(DestWriter, DestReader)> {
     let addr = SocketAddr::new(connect.dest_ip, connect.dest_port);
     match connect.protocol {
         TransportProtocol::Tcp => {
@@ -293,15 +266,14 @@ async fn open_dest(connect: &ConnectRequest) -> Result<DestSocket> {
                 .await
                 .with_context(|| format!("tcp connect timeout to {}", addr))??;
             s.set_nodelay(true).ok();
-            Ok(DestSocket::Tcp(s))
+            let (r, w) = s.into_split();
+            Ok((DestWriter::Tcp(w), DestReader::Tcp(r)))
         }
         TransportProtocol::Udp => {
-            // Bind a fresh ephemeral local port; "connect" the UDP socket so
-            // we can use plain send/recv without specifying address each time.
             let local = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-            let s = UdpSocket::bind(local).await?;
+            let s = Arc::new(UdpSocket::bind(local).await?);
             s.connect(addr).await.with_context(|| format!("udp connect to {}", addr))?;
-            Ok(DestSocket::Udp(s))
+            Ok((DestWriter::Udp(s.clone()), DestReader::Udp(s)))
         }
     }
 }

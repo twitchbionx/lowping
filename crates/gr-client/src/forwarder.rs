@@ -100,7 +100,7 @@ async fn run_rule(rule: Rule) -> Result<()> {
 
 async fn handle_local_connection(
     rule: Arc<Rule>,
-    mut local: TcpStream,
+    local: TcpStream,
     peer: SocketAddr,
 ) -> Result<()> {
     tracing::info!(local = %peer, dest = %format!("{}:{}", rule.dest_ip, rule.dest_port), "tunnel up");
@@ -155,8 +155,8 @@ async fn handle_local_connection(
     let udp_for_recv = udp.clone();
     let aead_for_recv = aead_key.clone();
 
-    // Split local TCP for independent read/write halves.
-    let (mut local_r, mut local_w) = local.split();
+    // Split local TCP into owned halves so each can move into its own task.
+    let (mut local_r, mut local_w) = local.into_split();
 
     // Sequence counter for tx.
     let mut tx_sequence: u64 = 0;
