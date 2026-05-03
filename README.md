@@ -50,7 +50,7 @@ A bridge needs a public IP and a UDP port open. Single static binary:
 
 ```bash
 # On any Linux VPS (Hetzner, OVH, Vultr — €4.50/mo is plenty):
-curl -L https://github.com/<TBD>/lowping/releases/latest/download/grbridge-x86_64-linux > grbridge
+curl -L https://github.com/twitchbionx/lowping/releases/latest/download/grbridge-x86_64-linux > grbridge
 chmod +x grbridge
 ./grbridge --listen 0.0.0.0:51820 --keys-file keys.toml
 ```

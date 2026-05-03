@@ -14,7 +14,7 @@ edition = "2024"
 rust-version = "1.85"
 authors = ["lowping contributors"]
 license = "Apache-2.0"
-repository = "https://github.com/REPLACE_ME/lowping"
+repository = "https://github.com/twitchbionx/lowping"
 readme = "README.md"
 
 [workspace.dependencies]
