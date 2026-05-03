@@ -45,6 +45,21 @@ struct Rule {
     /// For UDP rules: drop a session after this many seconds idle. Default 90.
     #[serde(default = "default_udp_idle")]
     udp_idle_secs: u64,
+
+    // ---------- transparent capture (Phase 3a, Windows only) ----------
+
+    /// If set, install a kernel-level WinDivert rule to transparently
+    /// redirect matching outbound traffic to this rule's `listen` address.
+    ///
+    /// Game's destination range — packets to here get redirected.
+    /// `capture_dst_port_hi` defaults to `capture_dst_port_lo` (single port).
+    #[serde(default)]
+    capture: bool,
+    pub capture_dst_port_lo: Option<u16>,
+    pub capture_dst_port_hi: Option<u16>,
+    /// Override the destination IP that the capture rule matches on. Defaults
+    /// to `dest_ip`. Useful if you want to capture a /32 route or wildcard.
+    pub capture_dst_ip: Option<IpAddr>,
 }
 
 fn default_proto() -> String { "tcp".into() }
@@ -67,6 +82,12 @@ pub async fn run(config_path: std::path::PathBuf, listen_override: Option<Socket
         cfg.rules[0].listen = addr;
     }
 
+    // Phase 3a: install transparent capture rules (Windows only). Any rule
+    // with `capture = true` gets a corresponding kernel-level DNAT rule that
+    // redirects game traffic to this rule's local listen address.
+    #[cfg(windows)]
+    let _capture_handle = install_capture(&cfg.rules)?;
+
     let mut handles = Vec::new();
     for rule in cfg.rules {
         let h = tokio::spawn(run_rule(Arc::new(rule)));
@@ -76,6 +97,46 @@ pub async fn run(config_path: std::path::PathBuf, listen_override: Option<Socket
         let _ = h.await;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn install_capture(rules: &[Rule]) -> Result<Option<gr_capture::WinDivertCapture>> {
+    use gr_capture::{Protocol, RedirectRule, Redirector};
+
+    let mut capture_rules = Vec::new();
+    for rule in rules {
+        if !rule.capture {
+            continue;
+        }
+        let protocol = match rule.protocol.as_str() {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            _ => continue,
+        };
+        let dst_ip = rule.capture_dst_ip.unwrap_or(rule.dest_ip);
+        let lo = rule.capture_dst_port_lo.unwrap_or(rule.dest_port);
+        let hi = rule.capture_dst_port_hi.unwrap_or(lo);
+        capture_rules.push(RedirectRule {
+            protocol,
+            dst_ip,
+            dst_port_lo: lo,
+            dst_port_hi: hi,
+            redirect_to_ip: rule.listen.ip(),
+            redirect_to_port: rule.listen.port(),
+        });
+        tracing::info!(
+            "transparent capture: {:?} {} :{}-{} -> {}",
+            protocol, dst_ip, lo, hi, rule.listen,
+        );
+    }
+    if capture_rules.is_empty() {
+        return Ok(None);
+    }
+    let cap = gr_capture::WinDivertCapture::new(capture_rules);
+    cap.start()
+        .map_err(|e| anyhow::anyhow!("starting WinDivert capture: {e}\nDid you run as Administrator?"))?;
+    tracing::info!("transparent capture armed (WinDivert)");
+    Ok(Some(cap))
 }
 
 async fn run_rule(rule: Arc<Rule>) -> Result<()> {

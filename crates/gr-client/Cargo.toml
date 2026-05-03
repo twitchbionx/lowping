@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 gr-protocol = { path = "../gr-protocol" }
 gr-common = { path = "../gr-common" }
+gr-capture = { path = "../gr-capture" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
