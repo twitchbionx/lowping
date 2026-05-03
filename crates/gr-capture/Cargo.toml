@@ -1,0 +1,25 @@
+[package]
+name = "gr-capture"
+description = "lowping packet capture / redirect: kernel-level traffic interception per platform"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+gr-common = { path = "../gr-common" }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+
+# Windows: WinDivert-backed capture (Phase 3a — pre-signed third-party driver)
+[target.'cfg(windows)'.dependencies]
+windivert = "0.7.0-beta.4"
+windivert-sys = "0.11.0-beta.2"
