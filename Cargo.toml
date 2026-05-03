@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gr-protocol",
+    "crates/gr-common",
+    "crates/gr-client",
+    "crates/gr-bridge",
+    "crates/gr-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+authors = ["lowping contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/REPLACE_ME/lowping"
+readme = "README.md"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util", "signal"] }
+tokio-util = "0.7"
+futures = "0.3"
+
+# Crypto — XChaCha20-Poly1305 for the tunnel
+chacha20poly1305 = "0.10"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand_core = { version = "0.6", features = ["std"] }
+
+# Reed-Solomon FEC
+reed-solomon-erasure = "6"
+
+# Serialization (config files, IPC)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Utility
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+parking_lot = "0.12"
+bitflags = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1  # crypto is unbearably slow at -O0

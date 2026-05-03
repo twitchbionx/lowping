@@ -1,0 +1,26 @@
+[package]
+name = "gr-protocol"
+description = "lowping wire protocol: framing, encryption, FEC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+
+[dependencies]
+chacha20poly1305 = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+reed-solomon-erasure = { workspace = true }
+serde = { workspace = true, optional = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+bitflags = { workspace = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

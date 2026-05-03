@@ -1,0 +1,39 @@
+[package]
+name = "gr-client"
+description = "lowping Windows userland service: rule engine, bridge selection, tunnel encryption"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "grclient"
+path = "src/main.rs"
+
+[dependencies]
+gr-protocol = { path = "../gr-protocol" }
+gr-common = { path = "../gr-common" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+parking_lot = { workspace = true }
+bytes = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only deps for talking to the WFP driver via inverted call (ALPC)
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_Security",
+] }

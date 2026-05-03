@@ -1,0 +1,54 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.vs/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tauri / Node
+node_modules/
+ui/dist/
+ui/build/
+ui/.svelte-kit/
+
+# WDK / driver build artifacts
+driver/x64/
+driver/arm64/
+driver/Debug/
+driver/Release/
+driver/*.cer
+driver/*.pfx
+*.obj
+*.exp
+*.lib
+*.exe
+*.sys
+*.cat
+*.inf.bak
+
+# Local config / secrets
+*.local.toml
+config.local.*
+.env
+.env.local
+secrets/
+*.pem
+*.key
+*.crt
+
+# Bridge runtime
+bridges.json
+state/
+logs/
+*.log
