@@ -39,6 +39,7 @@ use chacha20poly1305::{
 use thiserror::Error;
 
 pub mod fec;
+pub mod license;
 
 pub const HEADER_LEN: usize = 13;
 /// AEAD nonce length — derived, not transmitted.

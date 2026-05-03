@@ -20,6 +20,7 @@ serde = { workspace = true, optional = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 bitflags = { workspace = true }
+base64 = "0.22"
 
 [features]
 default = []

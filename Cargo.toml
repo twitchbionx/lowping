@@ -6,6 +6,7 @@ members = [
     "crates/gr-client",
     "crates/gr-bridge",
     "crates/gr-cli",
+    "crates/gr-backend",
 ]
 
 [workspace.package]
@@ -36,6 +37,11 @@ reed-solomon-erasure = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+# HTTP server (gr-backend)
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "limit"] }
 
 # Logging
 tracing = "0.1"
