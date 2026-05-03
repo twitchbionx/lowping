@@ -1,0 +1,26 @@
+# lowping backend config — copy to /etc/lowping/backend.toml and fill in.
+
+# HTTP listen address.
+listen = "0.0.0.0:8080"
+
+# Backend's Ed25519 secret key (32 bytes hex). Used to sign license tokens
+# AND bridge directory documents. Generate with: grbackend gen-key
+backend_seckey_hex = "REPLACE_WITH_YOUR_32_BYTES_HEX"
+
+# How long license tokens are valid. Default 7 days (604800 seconds).
+# token_ttl_secs = 604800
+
+# How long bridge directories are cached by clients. Default 30 minutes.
+# directory_ttl_secs = 1800
+
+# All bridges this backend knows about. Operator-curated. Add an entry per
+# bridge you operate. Restart `grbackend` after editing.
+[[bridges]]
+id = "dal-1"
+name = "Dallas"
+region = "NA"
+zone = "NAC"
+endpoint = "REPLACE.WITH.BRIDGE.IP:51820"
+pubkey_hex = "REPLACE_WITH_BRIDGE_X25519_PUBKEY_HEX"
+game_zones = ["fortnite-NAC", "valorant-NAC", "cs2-NAC"]
+enabled = true

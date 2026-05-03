@@ -1,0 +1,26 @@
+# lowping bridge config — copy to /etc/lowping/bridge.toml and fill in.
+
+# UDP socket the bridge listens on. Open this port in your VPS firewall.
+listen = "0.0.0.0:51820"
+
+# Bridge's long-term X25519 secret key (32 bytes hex).
+# Generate with: grbridge gen-key
+bridge_x25519_seckey_hex = "REPLACE_WITH_YOUR_32_BYTES_HEX"
+
+# Backend's Ed25519 public key (32 bytes hex). Bridges use this to verify
+# license tokens presented by clients. Get it from the backend on first setup
+# (`grbackend gen-key` prints both secret and pubkey).
+backend_ed25519_pubkey_hex = "REPLACE_WITH_BACKEND_PUBKEY_HEX"
+
+# If true, accept any signed token regardless of scope. Useful for solo / dev.
+# In production, leave false and enforce scope bit 0 ("any-bridge").
+allow_any_scope = false
+
+# Maximum concurrent active sessions. Default 10000.
+# max_sessions = 10000
+
+# Drop sessions idle for this many seconds. Default 300.
+# idle_timeout_secs = 300
+
+# Optional Prometheus metrics endpoint.
+# metrics_listen = "127.0.0.1:9100"

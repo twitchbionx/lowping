@@ -1,0 +1,39 @@
+[Unit]
+Description=lowping bridge — game traffic relay
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/twitchbionx/lowping
+
+[Service]
+Type=simple
+User=grbridge
+Group=grbridge
+ExecStart=/usr/local/bin/grbridge serve --config /etc/lowping/bridge.toml
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=/var/log/lowping
+
+# Resource limits
+LimitNOFILE=65536
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target

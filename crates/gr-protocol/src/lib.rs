@@ -39,6 +39,7 @@ use chacha20poly1305::{
 use thiserror::Error;
 
 pub mod fec;
+pub mod handshake;
 pub mod license;
 
 pub const HEADER_LEN: usize = 13;
@@ -172,6 +173,88 @@ pub fn decrypt_frame(key: &Key, wire: &[u8]) -> Result<(Header, Vec<u8>)> {
         .decrypt(nonce, Payload { msg: &wire[HEADER_LEN..], aad: &wire[..HEADER_LEN] })
         .map_err(|_| ProtocolError::AeadFailed)?;
     Ok((header, pt))
+}
+
+// ---------- SYN frame format (handshake) ----------
+
+/// X25519 public key length (32 bytes), as it appears on the wire in SYN frames.
+pub const PUBKEY_LEN: usize = 32;
+/// SYN frames carry the client's ephemeral X25519 pubkey in plaintext between
+/// the header and the ciphertext.
+pub const SYN_HEADER_LEN: usize = HEADER_LEN + PUBKEY_LEN;
+pub const MIN_SYN_FRAME_LEN: usize = SYN_HEADER_LEN + TAG_LEN;
+
+/// Encrypt a SYN frame: prepends the client's ephemeral pubkey in plaintext,
+/// AEADs the payload with `aead_key`, AAD covers (header || pubkey).
+pub fn encrypt_syn_frame(
+    aead_key: &Key,
+    header: &Header,
+    client_pubkey: &[u8; PUBKEY_LEN],
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    if payload.len() > MAX_PAYLOAD_LEN {
+        return Err(ProtocolError::PayloadTooLarge(payload.len()));
+    }
+    if !header.flags.contains(Flags::SYN) {
+        // Caller error — should always have SYN flag if using this function.
+        // We still produce output but tests should catch this.
+    }
+    let mut header_bytes = [0u8; HEADER_LEN];
+    header.encode(&mut header_bytes);
+
+    let mut aad = Vec::with_capacity(SYN_HEADER_LEN);
+    aad.extend_from_slice(&header_bytes);
+    aad.extend_from_slice(client_pubkey);
+
+    let cipher = ChaCha20Poly1305::new(aead_key);
+    let nonce_bytes = derive_nonce(header.connection_id, header.sequence);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, Payload { msg: payload, aad: &aad })
+        .map_err(|_| ProtocolError::AeadFailed)?;
+
+    let mut out = Vec::with_capacity(SYN_HEADER_LEN + ct.len());
+    out.extend_from_slice(&aad);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Parse the plaintext front of a SYN frame: returns header + client pubkey.
+/// Caller then derives session key via ECDH and calls [`decrypt_syn_payload`].
+pub fn parse_syn_front(wire: &[u8]) -> Result<(Header, [u8; PUBKEY_LEN])> {
+    if wire.len() < MIN_SYN_FRAME_LEN {
+        return Err(ProtocolError::Truncated {
+            got: wire.len(),
+            need: MIN_SYN_FRAME_LEN,
+        });
+    }
+    let header = Header::decode(&wire[..HEADER_LEN])?;
+    let mut pk = [0u8; PUBKEY_LEN];
+    pk.copy_from_slice(&wire[HEADER_LEN..SYN_HEADER_LEN]);
+    Ok((header, pk))
+}
+
+/// Decrypt a SYN frame's encrypted payload using the derived session key.
+pub fn decrypt_syn_payload(aead_key: &Key, wire: &[u8]) -> Result<Vec<u8>> {
+    if wire.len() < MIN_SYN_FRAME_LEN {
+        return Err(ProtocolError::Truncated {
+            got: wire.len(),
+            need: MIN_SYN_FRAME_LEN,
+        });
+    }
+    let cipher = ChaCha20Poly1305::new(aead_key);
+    let header = Header::decode(&wire[..HEADER_LEN])?;
+    let nonce_bytes = derive_nonce(header.connection_id, header.sequence);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &wire[SYN_HEADER_LEN..],
+                aad: &wire[..SYN_HEADER_LEN],
+            },
+        )
+        .map_err(|_| ProtocolError::AeadFailed)
 }
 
 /// CONNECT control message — sent in the SYN frame's encrypted payload.
@@ -345,6 +428,63 @@ mod tests {
         header_bytes[0] = 7;
         let err = Header::decode(&header_bytes).unwrap_err();
         assert!(matches!(err, ProtocolError::UnknownVersion(7)));
+    }
+
+    #[test]
+    fn syn_frame_roundtrip_via_ecdh() {
+        use crate::handshake;
+        let (bridge_sk, bridge_pk) = handshake::generate_keypair();
+        let (client_sk, client_pk) = handshake::generate_keypair();
+
+        // Client side: derive session key, encrypt SYN.
+        let client_aead = handshake::client_derive_session_key(&client_sk, &bridge_pk);
+        let client_pk_bytes = client_pk.to_bytes();
+        let header = Header {
+            version: PROTO_VERSION,
+            flags: Flags::SYN,
+            connection_id: 0xFEEDC0DE,
+            sequence: 0,
+        };
+        let inner_payload = b"license_token_bytes_then_connect_request";
+        let wire = encrypt_syn_frame(&client_aead, &header, &client_pk_bytes, inner_payload).unwrap();
+
+        // Bridge side: parse front, derive session key, decrypt rest.
+        let (parsed_header, peer_pk_bytes) = parse_syn_front(&wire).unwrap();
+        assert_eq!(parsed_header, header);
+        let peer_pk = handshake::pubkey_from_bytes(&peer_pk_bytes).unwrap();
+        let bridge_aead = handshake::bridge_derive_session_key(&bridge_sk, &peer_pk);
+        assert_eq!(bridge_aead.as_slice(), client_aead.as_slice());
+        let decrypted = decrypt_syn_payload(&bridge_aead, &wire).unwrap();
+        assert_eq!(decrypted.as_slice(), inner_payload);
+    }
+
+    #[test]
+    fn syn_frame_with_wrong_bridge_key_fails() {
+        use crate::handshake;
+        let (_, bridge_pk) = handshake::generate_keypair();
+        let (wrong_bridge_sk, _) = handshake::generate_keypair();
+        let (client_sk, client_pk) = handshake::generate_keypair();
+        let client_aead = handshake::client_derive_session_key(&client_sk, &bridge_pk);
+        let client_pk_bytes = client_pk.to_bytes();
+        let header = Header {
+            version: PROTO_VERSION, flags: Flags::SYN, connection_id: 1, sequence: 0,
+        };
+        let wire = encrypt_syn_frame(&client_aead, &header, &client_pk_bytes, b"hello").unwrap();
+        let (_, peer_pk_bytes) = parse_syn_front(&wire).unwrap();
+        let peer_pk = handshake::pubkey_from_bytes(&peer_pk_bytes).unwrap();
+        let bridge_aead = handshake::bridge_derive_session_key(&wrong_bridge_sk, &peer_pk);
+        let result = decrypt_syn_payload(&bridge_aead, &wire);
+        assert!(matches!(result, Err(ProtocolError::AeadFailed)));
+    }
+
+    #[test]
+    fn syn_frame_truncated_rejected() {
+        // Wire is shorter than even SYN_HEADER_LEN
+        let too_short = vec![0u8; HEADER_LEN + 10];
+        assert!(matches!(
+            parse_syn_front(&too_short),
+            Err(ProtocolError::Truncated { .. })
+        ));
     }
 
     #[test]

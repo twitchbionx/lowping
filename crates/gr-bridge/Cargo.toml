@@ -27,3 +27,8 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
+chacha20poly1305 = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"

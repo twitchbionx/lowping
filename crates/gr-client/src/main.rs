@@ -1,26 +1,36 @@
-//! lowping client — Windows userland service.
+//! lowping client — Phase 1: a TCP→tunnel forwarder.
 //!
-//! Phase 0: empty skeleton. Real work lands in subsequent phases.
+//! No driver yet. This binary listens on a local TCP port. Every connection
+//! gets tunneled to a configured bridge, forwarded to a configured destination.
+//!
+//! When the WFP driver lands (Phase 3) the listener is replaced by a callback
+//! from the kernel — same tunnel logic.
+
+mod forwarder;
 
 use anyhow::Result;
 use clap::Parser;
+use std::net::SocketAddr;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "lowping client service")]
+#[command(version, about = "lowping client (Phase 1 TCP forwarder)")]
 struct Cli {
     /// Path to client config file (TOML).
-    #[arg(short, long, env = "LOWPING_CONFIG", default_value = "lowping.toml")]
-    config: std::path::PathBuf,
-
-    /// Verbose logging (use multiple times: -v, -vv, -vvv).
+    #[arg(short, long, env = "LOWPING_CONFIG", default_value = "client.toml")]
+    config: PathBuf,
+    /// Local TCP listen address (overrides config).
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// Verbose logging (-v debug, -vv trace).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 }
 
 fn init_tracing(verbose: u8) {
     let level = match verbose {
-        0 => "info",
-        1 => "debug",
+        0 => "info,gr_client=info",
+        1 => "debug,gr_client=debug",
         _ => "trace",
     };
     tracing_subscriber::fmt()
@@ -35,14 +45,5 @@ fn init_tracing(verbose: u8) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
-
-    tracing::info!(config = %cli.config.display(), "lowping client starting");
-    tracing::warn!("phase 0 skeleton — nothing actually does anything yet");
-
-    // TODO Phase 1: connect to driver via ALPC, accept redirected connections,
-    //               forward to a single configured bridge.
-
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutdown");
-    Ok(())
+    forwarder::run(cli.config, cli.listen).await
 }
