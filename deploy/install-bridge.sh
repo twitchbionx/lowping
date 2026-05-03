@@ -19,7 +19,7 @@ INSTALL_PREFIX="/usr/local/bin"
 CONFIG_DIR="/etc/lowping"
 SERVICE_USER="grbridge"
 LOG_DIR="/var/log/lowping"
-LISTEN_PORT="${LISTEN_PORT:-51820}"
+LISTEN_PORT="${LISTEN_PORT:-52820}"  # avoid wireguard's 51820 default
 
 if [[ $EUID -ne 0 ]]; then
     echo "must run as root (try: sudo $0)"

@@ -1,7 +1,7 @@
 # lowping bridge config — copy to /etc/lowping/bridge.toml and fill in.
 
 # UDP socket the bridge listens on. Open this port in your VPS firewall.
-listen = "0.0.0.0:51820"
+listen = "0.0.0.0:52820"  # 51820 is wireguard default — avoid collision
 
 # Bridge's long-term X25519 secret key (32 bytes hex).
 # Generate with: grbridge gen-key
