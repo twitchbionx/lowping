@@ -123,29 +123,59 @@ Save that license_token — your client uses it.
 On your **Windows machine**, in the lowping repo:
 
 ```powershell
-# Build the client
 cargo build --release -p gr-client
+```
 
-# Create C:\Users\Elijah\Desktop\lowping\client.toml:
+### TCP test (HTTP through the tunnel)
+
+Create `C:\Users\Elijah\Desktop\lowping\client.toml`:
+
+```toml
 [[rules]]
 listen = "127.0.0.1:9000"
-bridge = "<vps-ip>:51820"
+bridge = "<vps-ip>:52820"
 bridge_x25519_pubkey_hex = "<x25519 pubkey from earlier>"
 license_token = "<token from /v1/signup>"
 dest_ip = "1.1.1.1"
 dest_port = 80
 protocol = "tcp"
-
-# Run client
-.\target\release\grclient.exe
-
-# In another terminal:
-curl --resolve one.one.one.one:80:127.0.0.1:9000 -v http://one.one.one.one/
 ```
 
-If `curl` returns a Cloudflare 301 / response, it worked: your HTTP went
-Windows → grclient → tunnel → VPS bridge → Cloudflare. The `X-Forwarded-For`
-or whatever the upstream sees should be your **VPS IP**, not your home IP.
+Run + test:
+
+```powershell
+.\target\release\grclient.exe
+# in another terminal:
+curl -H "Host: one.one.one.one" http://127.0.0.1:9000/
+# Expect: 301 Moved Permanently from Cloudflare
+```
+
+### UDP test (DNS through the tunnel)
+
+Add another rule to `client.toml`:
+
+```toml
+[[rules]]
+listen = "127.0.0.1:9053"
+bridge = "<vps-ip>:52820"
+bridge_x25519_pubkey_hex = "<x25519 pubkey>"
+license_token = "<token>"
+dest_ip = "1.1.1.1"
+dest_port = 53
+protocol = "udp"
+```
+
+Run grclient and query via Python (Windows `nslookup` doesn't take a custom
+port nicely):
+
+```powershell
+python -c "import socket, struct; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5); s.sendto(b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06github\x03com\x00\x00\x01\x00\x01', ('127.0.0.1', 9053)); r,_=s.recvfrom(1024); print('answer bytes:', r.hex())"
+# Expect: a non-empty response containing github.com's A record
+```
+
+Both TCP and UDP rules work simultaneously — grclient handles them in parallel
+tasks. For UDP rules, each unique local source `(ip, port)` becomes its own
+tunnel; sessions idle for `udp_idle_secs` (default 90s) are reaped automatically.
 
 ## 7. Production hardening (do later, before going public)
 
