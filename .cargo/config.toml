@@ -1,3 +1,2 @@
-# Build-time env vars for crates that need vendored libraries.
 [env]
-WINDIVERT_PATH = { value = "vendor/windivert/WinDivert-2.2.2-A", relative = true, force = true }
+WINDIVERT_PATH = { value = "vendor/windivert/WinDivert-2.2.2-A/x64", relative = true, force = true }

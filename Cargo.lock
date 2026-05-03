@@ -655,12 +655,14 @@ name = "gr-capture"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "clap",
  "gr-common",
  "parking_lot 0.12.5",
  "serde",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "windivert",
  "windivert-sys",
 ]

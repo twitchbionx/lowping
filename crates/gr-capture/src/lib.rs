@@ -28,6 +28,9 @@ use thiserror::Error;
 #[cfg(windows)]
 pub mod windivert_backend;
 
+#[cfg(windows)]
+pub use windivert_backend::WinDivertCapture;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
