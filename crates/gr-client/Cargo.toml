@@ -32,6 +32,8 @@ chacha20poly1305 = { workspace = true }
 x25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 hex = "0.4"
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Windows-only deps for talking to the WFP driver via inverted call (ALPC)

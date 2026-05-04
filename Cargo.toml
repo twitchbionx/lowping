@@ -62,6 +62,10 @@ clap = { version = "4", features = ["derive", "env"] }
 parking_lot = "0.12"
 bitflags = "2"
 
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

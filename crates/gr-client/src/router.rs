@@ -26,7 +26,7 @@
 use gr_common::aws_regions::AwsLookup;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +64,18 @@ struct Decision {
     via_bridge_rtt_ms: f64,
 }
 
+/// Per-decision audit log entry. Used by the TUI's "recent decisions" panel.
+#[derive(Debug, Clone)]
+pub struct DecisionLog {
+    pub at: Instant,
+    pub dest: SocketAddr,
+    pub region: Option<String>,
+    pub direct_rtt_ms: f64,
+    pub via_bridge_rtt_ms: f64,
+    pub route: Route,
+    pub bridge_name: Option<String>,
+}
+
 /// Stateful route picker. Holds the bridge directory + AWS lookup + decision cache.
 pub struct Router {
     bridges: Vec<BridgeEntry>,
@@ -71,6 +83,9 @@ pub struct Router {
     client_to_bridge_ms: RwLock<HashMap<String, f64>>,
     aws: AwsLookup,
     cache: RwLock<HashMap<IpAddr, Decision>>,
+    /// Ring buffer of the last N decisions made (for the TUI).
+    recent: RwLock<VecDeque<DecisionLog>>,
+    recent_capacity: usize,
     /// Hysteresis: only choose a bridge if it beats direct by this margin (ms).
     margin_ms: f64,
     /// Re-evaluate cached decisions older than this.
@@ -84,9 +99,22 @@ impl Router {
             client_to_bridge_ms: RwLock::new(HashMap::new()),
             aws: AwsLookup::load_bundled(),
             cache: RwLock::new(HashMap::new()),
+            recent: RwLock::new(VecDeque::with_capacity(64)),
+            recent_capacity: 64,
             margin_ms: 2.0,
             reroute_interval: Duration::from_secs(60),
         }
+    }
+
+    /// Snapshot of recent decisions, newest first.
+    pub fn recent_decisions(&self, n: usize) -> Vec<DecisionLog> {
+        let r = self.recent.read();
+        r.iter().rev().take(n).cloned().collect()
+    }
+
+    /// Snapshot of current client→bridge RTT measurements.
+    pub fn client_rtt_snapshot(&self) -> HashMap<String, f64> {
+        self.client_to_bridge_ms.read().clone()
     }
 
     pub fn bridges(&self) -> &[BridgeEntry] {
@@ -150,6 +178,26 @@ impl Router {
             via_bridge_rtt_ms: via_total,
         };
         self.cache.write().insert(dest.ip(), decision);
+
+        // Push to recent decisions log (ring buffer)
+        {
+            let mut r = self.recent.write();
+            if r.len() >= self.recent_capacity {
+                r.pop_front();
+            }
+            r.push_back(DecisionLog {
+                at: Instant::now(),
+                dest,
+                region: region.map(|s| s.to_string()),
+                direct_rtt_ms,
+                via_bridge_rtt_ms: via_total,
+                route,
+                bridge_name: match route {
+                    Route::ViaBridge(i) => Some(self.bridges[i].name.clone()),
+                    Route::Direct => None,
+                },
+            });
+        }
 
         if matches!(route, Route::ViaBridge(_)) {
             tracing::info!(

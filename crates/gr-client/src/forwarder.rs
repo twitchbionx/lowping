@@ -66,9 +66,9 @@ fn default_proto() -> String { "tcp".into() }
 fn default_udp_idle() -> u64 { 90 }
 
 #[derive(Debug, Deserialize)]
-struct Config {
+pub struct Config {
     #[serde(default)]
-    rules: Vec<Rule>,
+    pub rules: Vec<Rule>,
     /// Smart-routing mode (Phase 3b.2). If present, multi-bridge dynamic
     /// routing replaces per-rule static config.
     #[cfg(windows)]

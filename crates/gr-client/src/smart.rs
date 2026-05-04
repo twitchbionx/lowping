@@ -120,46 +120,60 @@ impl UdpSession {
 
 type SessionMap = Arc<RwLock<HashMap<u16, Arc<UdpSession>>>>;
 
-pub async fn run_smart(
+/// Start smart-routing listeners. Returns the shared Router so the caller
+/// (e.g., the TUI) can read state. Listeners run in background tasks; this
+/// function returns immediately after spawning them.
+pub fn start_smart(
     cfg: SmartRoutingConfig,
     capture: Option<Arc<WinDivertCapture>>,
-) -> Result<()> {
+) -> Arc<Router> {
     let router = Arc::new(Router::new(cfg.bridges.clone()));
 
-    // For now: hardcoded baseline (ICMP probing comes next iteration).
-    // We assume client→bridge ≈ direct ping to bridge endpoint.
-    // TODO: replace with live ICMP probe at startup + every N seconds.
+    // Placeholder client→bridge RTTs. Phase 3b.3 replaces with live ICMP.
+    // Use a per-name override table so the user can hand-tune in the meantime.
     for b in &cfg.bridges {
-        // Cheap heuristic: just use a fixed estimate per bridge name. Operator
-        // can override via region_rtt_ms in config.
-        // Better: ICMP ping.
-        router.record_client_to_bridge(&b.name, 30.0);
-        tracing::info!(bridge = %b.name, "added to router with placeholder client_rtt = 30.0ms");
+        let est = match b.name.as_str() {
+            "dallas" => 22.0,
+            "nj" => 35.0,
+            "seattle" | "sea" => 50.0,
+            "frankfurt" | "fra" => 110.0,
+            _ => 40.0,
+        };
+        router.record_client_to_bridge(&b.name, est);
+        tracing::info!(
+            bridge = %b.name,
+            estimated_client_rtt = est,
+            "router seeded (Phase 3b.3 will replace with live ICMP probe)"
+        );
     }
 
-    // Spawn one UDP listener per bridge.
-    let mut handles = Vec::new();
     for (idx, bridge) in cfg.bridges.iter().enumerate() {
         let bridge = bridge.clone();
         let capture = capture.clone();
         let listen = SocketAddr::new("127.0.0.1".parse().unwrap(), bridge.listen_port);
-        let h = tokio::spawn(async move {
+        tokio::spawn(async move {
             if let Err(e) = run_bridge_listener(bridge.clone(), listen, capture).await {
                 tracing::error!(bridge = %bridge.name, error = ?e, "listener exited");
             }
             let _ = idx;
         });
-        handles.push(h);
     }
 
-    // Block on all listeners
-    for h in handles {
-        let _ = h.await;
-    }
+    router
+}
+
+/// Old API for callers that just want to block forever after starting smart mode.
+pub async fn run_smart(
+    cfg: SmartRoutingConfig,
+    capture: Option<Arc<WinDivertCapture>>,
+) -> Result<()> {
+    let _router = start_smart(cfg, capture);
+    // Block forever; listeners are running in background.
+    futures::future::pending::<()>().await;
     Ok(())
 }
 
-async fn run_bridge_listener(
+pub async fn run_bridge_listener(
     bridge: BridgeEntry,
     listen: SocketAddr,
     capture: Option<Arc<WinDivertCapture>>,
