@@ -161,6 +161,31 @@ impl WinDivertCapture {
     }
 }
 
+impl WinDivertCapture {
+    /// Look up the original game-server destination for a captured flow.
+    ///
+    /// When the capture loop rewrites an outbound packet from
+    /// `(game_src_ip, game_src_port) → (orig_dst_ip, orig_dst_port)` to point
+    /// at our local listener, it records the original destination keyed by
+    /// `game_src_port`. The local listener can then call this to discover where
+    /// the game *meant* to send each datagram, and tunnel it to the right place.
+    pub fn flow_origin(&self, game_src_port: u16) -> Option<SocketAddr> {
+        let flows = self.flows.read();
+        let e = flows.get(&game_src_port)?;
+        Some(SocketAddr::new(IpAddr::V4(e.orig_dst_ip), e.orig_dst_port))
+    }
+
+    /// All currently-tracked (game_src_port, original_dest) pairs.
+    /// Useful for debugging / observability.
+    pub fn active_flows(&self) -> Vec<(u16, SocketAddr)> {
+        self.flows
+            .read()
+            .iter()
+            .map(|(p, e)| (*p, SocketAddr::new(IpAddr::V4(e.orig_dst_ip), e.orig_dst_port)))
+            .collect()
+    }
+}
+
 impl Redirector for WinDivertCapture {
     fn start(&self) -> Result<()> {
         if self.running.swap(true, Ordering::SeqCst) {
