@@ -67,7 +67,14 @@ fn default_udp_idle() -> u64 { 90 }
 
 #[derive(Debug, Deserialize)]
 struct Config {
+    #[serde(default)]
     rules: Vec<Rule>,
+    /// Smart-routing mode (Phase 3b.2). If present, multi-bridge dynamic
+    /// routing replaces per-rule static config.
+    #[cfg(windows)]
+    pub smart_routing: Option<crate::smart::SmartRoutingConfig>,
+    #[cfg(not(windows))]
+    pub smart_routing: Option<serde_json::Value>,
 }
 
 pub async fn run(config_path: std::path::PathBuf, listen_override: Option<SocketAddr>) -> Result<()> {
@@ -80,6 +87,13 @@ pub async fn run(config_path: std::path::PathBuf, listen_override: Option<Socket
             anyhow::bail!("--listen given but no rules in config");
         }
         cfg.rules[0].listen = addr;
+    }
+
+    // Phase 3b.2: smart routing mode (multi-bridge auto-pick) takes priority
+    // if configured. Falls through to legacy per-rule mode otherwise.
+    #[cfg(windows)]
+    if let Some(smart_cfg) = cfg.smart_routing.clone() {
+        return run_smart_mode(smart_cfg).await;
     }
 
     // Phase 3a: install transparent capture rules (Windows only). Any rule
@@ -97,6 +111,51 @@ pub async fn run(config_path: std::path::PathBuf, listen_override: Option<Socket
         let _ = h.await;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+async fn run_smart_mode(cfg: crate::smart::SmartRoutingConfig) -> Result<()> {
+    use crate::router::Router;
+    use crate::smart::{run_smart, SmartResolver};
+    use gr_capture::{Redirector, WinDivertCapture};
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
+    if cfg.bridges.is_empty() {
+        anyhow::bail!("smart_routing.bridges is empty");
+    }
+    let bridges = cfg.bridges.clone();
+    tracing::info!(
+        bridges = bridges.len(),
+        "smart routing mode: multi-bridge auto-pick"
+    );
+    for b in &bridges {
+        tracing::info!("  bridge {} → {} (listen :{})", b.name, b.endpoint, b.listen_port);
+    }
+
+    // Build router + resolver
+    let router = Arc::new(Router::new(bridges.clone()));
+    let resolver: Arc<dyn gr_capture::RouteResolver> = Arc::new(SmartResolver::new(
+        router.clone(),
+        cfg.direct_rtt_ms.clone(),
+    ));
+
+    // Tell capture which (ip, port) targets it might rewrite TO + which
+    // bridge endpoints to NEVER capture (would loop).
+    let redirect_targets: Vec<SocketAddr> = bridges
+        .iter()
+        .map(|b| SocketAddr::new(IpAddr::V4("127.0.0.1".parse().unwrap()), b.listen_port))
+        .collect();
+    let bridge_endpoints: Vec<SocketAddr> = bridges.iter().map(|b| b.endpoint).collect();
+
+    let capture = Arc::new(WinDivertCapture::with_resolver(
+        resolver, redirect_targets, bridge_endpoints,
+    ));
+    capture.start()
+        .map_err(|e| anyhow::anyhow!("starting smart WinDivertCapture: {e}\nDid you run as Administrator?"))?;
+    tracing::info!("smart capture armed (WinDivert)");
+
+    run_smart(cfg, Some(capture)).await
 }
 
 #[cfg(windows)]

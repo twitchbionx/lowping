@@ -9,6 +9,9 @@
 mod forwarder;
 mod router;
 
+#[cfg(windows)]
+mod smart;
+
 use anyhow::Result;
 use clap::Parser;
 use std::net::SocketAddr;
