@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod aws_regions;
+
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use thiserror::Error;

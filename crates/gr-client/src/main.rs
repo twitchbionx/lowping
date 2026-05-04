@@ -7,6 +7,7 @@
 //! from the kernel — same tunnel logic.
 
 mod forwarder;
+mod router;
 
 use anyhow::Result;
 use clap::Parser;
