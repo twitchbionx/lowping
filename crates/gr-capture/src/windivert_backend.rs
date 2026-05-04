@@ -1,29 +1,31 @@
 //! WinDivert-backed packet capture + DNAT for Windows.
 //!
-//! ## How it works
+//! ## Two operating modes
 //!
-//! For each captured packet (per filter expression in [`build_filter`]):
+//! 1. **Legacy fixed-rule mode**: pass `Vec<RedirectRule>` to
+//!    [`WinDivertCapture::with_rules`]. Filter targets specific dst_ip+port
+//!    ranges. Simple but no auto bridge selection.
 //!
-//! - **Outbound** matching a rule:
-//!   - Save `src_port -> (orig_dst_ip, orig_dst_port)` in the flow table.
-//!   - Rewrite `dst_ip := redirect_to_ip` and `dst_port := redirect_to_port`.
-//!   - Recompute IP+UDP/TCP checksums.
-//!   - Re-inject.
+//! 2. **Smart-routing mode**: pass any `RouteResolver` impl to
+//!    [`WinDivertCapture::with_resolver`]. Filter is broad ("all UDP outbound
+//!    not to bridges"); per-packet decision via the resolver. Use with
+//!    `gr_client::router::Router` for live multi-bridge picking.
 //!
-//! - **Inbound** from the local target (response coming back from grclient):
-//!   - Look up flow by `dst_port` (which equals the game's original `src_port`).
-//!   - Rewrite `src_ip := orig_dst_ip` and `src_port := orig_dst_port`.
-//!   - Recompute checksums.
-//!   - Re-inject.
+//! ## NAT model (both modes)
 //!
-//! Result: the game's socket sees responses as if they came directly from the
-//! original game server. Game has no idea anything was rewritten.
+//! Outbound match → save (src_port, orig_dst, redirect_target) flow entry,
+//! rewrite dst, recompute checksums, re-inject. Inbound from a redirect
+//! target → look up flow by dst_port, rewrite src back to the original game
+//! server so the game's socket sees a normal response.
 
-use crate::{CaptureError, Protocol, RedirectRule, RedirectStats, Redirector, Result};
+use crate::{
+    CaptureError, FixedResolver, Protocol, RedirectRule, RedirectStats, Redirector, Result,
+    RouteAction, RouteResolver,
+};
 use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -37,11 +39,23 @@ use windivert_sys::ChecksumFlags;
 struct FlowEntry {
     orig_dst_ip: Ipv4Addr,
     orig_dst_port: u16,
+    /// The (ip, port) we rewrote outbound traffic to. Inbound packets from
+    /// this address are the responses we need to rewrite back.
+    redirect_target: SocketAddr,
     last_seen: Instant,
 }
 
+/// All [`SocketAddr`]s our redirector might rewrite TO. Used to build the
+/// inbound half of the WinDivert filter expression.
+type RedirectTargets = Vec<SocketAddr>;
+
 pub struct WinDivertCapture {
-    rules: Vec<RedirectRule>,
+    resolver: Arc<dyn RouteResolver>,
+    /// IPs/ports our resolver might rewrite TO. Required up-front for the
+    /// inbound side of the WinDivert filter.
+    redirect_targets: RedirectTargets,
+    /// Bridge endpoints we MUST NOT capture (we'd loop forever).
+    bridge_endpoints: Vec<SocketAddr>,
     flows: Arc<RwLock<HashMap<u16, FlowEntry>>>,
     stats: Arc<Stats>,
     running: Arc<AtomicBool>,
@@ -57,9 +71,41 @@ struct Stats {
 }
 
 impl WinDivertCapture {
+    /// Legacy: build from a fixed rule list.
     pub fn new(rules: Vec<RedirectRule>) -> Self {
+        Self::with_rules(rules, vec![])
+    }
+
+    /// Build with explicit rules and an explicit bridge-endpoint exclusion list
+    /// (so we don't capture our own tunnel traffic).
+    pub fn with_rules(rules: Vec<RedirectRule>, bridge_endpoints: Vec<SocketAddr>) -> Self {
+        let targets = rules
+            .iter()
+            .map(|r| SocketAddr::new(r.redirect_to_ip, r.redirect_to_port))
+            .collect();
         Self {
-            rules,
+            resolver: Arc::new(FixedResolver(rules)),
+            redirect_targets: targets,
+            bridge_endpoints,
+            flows: Arc::new(RwLock::new(HashMap::new())),
+            stats: Arc::new(Stats::default()),
+            running: Arc::new(AtomicBool::new(false)),
+            handle: parking_lot::Mutex::new(None),
+            flow_idle: Duration::from_secs(120),
+        }
+    }
+
+    /// Smart mode: any resolver, with the set of (ip, port) addresses it might
+    /// rewrite TO and the bridge endpoints to exclude from capture.
+    pub fn with_resolver(
+        resolver: Arc<dyn RouteResolver>,
+        redirect_targets: Vec<SocketAddr>,
+        bridge_endpoints: Vec<SocketAddr>,
+    ) -> Self {
+        Self {
+            resolver,
+            redirect_targets,
+            bridge_endpoints,
             flows: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(Stats::default()),
             running: Arc::new(AtomicBool::new(false)),
@@ -69,34 +115,49 @@ impl WinDivertCapture {
     }
 
     fn build_filter(&self) -> Result<String> {
-        if self.rules.is_empty() {
-            return Err(CaptureError::Other("no rules configured".into()));
-        }
-        let mut clauses = Vec::new();
-        for rule in &self.rules {
-            let proto = match rule.protocol {
-                Protocol::Tcp => "tcp",
-                Protocol::Udp => "udp",
-            };
-            let dst_ip = match rule.dst_ip {
-                IpAddr::V4(v4) => v4,
-                IpAddr::V6(_) => continue,
-            };
-            let local = match rule.redirect_to_ip {
-                IpAddr::V4(v4) => v4,
-                IpAddr::V6(_) => continue,
-            };
-            clauses.push(format!(
-                "({proto} and outbound and ip.DstAddr == {dst_ip} and {proto}.DstPort >= {lo} and {proto}.DstPort <= {hi})",
-                lo = rule.dst_port_lo,
-                hi = rule.dst_port_hi,
-            ));
-            clauses.push(format!(
-                "({proto} and inbound and ip.SrcAddr == {local} and {proto}.SrcPort == {port})",
-                port = rule.redirect_to_port,
+        if self.redirect_targets.is_empty() {
+            return Err(CaptureError::Other(
+                "no redirect targets — at least one is needed to capture inbound responses"
+                    .into(),
             ));
         }
-        Ok(clauses.join(" or "))
+        // Outbound: any UDP outbound, EXCEPT to bridge endpoints (avoid loop)
+        // and EXCEPT to our redirect targets themselves (avoid loop).
+        let mut excludes: Vec<String> = Vec::new();
+        for ep in &self.bridge_endpoints {
+            if let IpAddr::V4(v4) = ep.ip() {
+                excludes.push(format!("ip.DstAddr == {v4}"));
+            }
+        }
+        for tgt in &self.redirect_targets {
+            if let IpAddr::V4(v4) = tgt.ip() {
+                excludes.push(format!("ip.DstAddr == {v4}"));
+            }
+        }
+        let exclude_clause = if excludes.is_empty() {
+            String::new()
+        } else {
+            format!(" and not ({})", excludes.join(" or "))
+        };
+
+        // Inbound: only packets coming from our redirect targets (responses
+        // from grclient that need src-rewriting).
+        let inbound_targets: Vec<String> = self
+            .redirect_targets
+            .iter()
+            .filter_map(|t| match t.ip() {
+                IpAddr::V4(v4) => Some(format!(
+                    "(ip.SrcAddr == {v4} and udp.SrcPort == {})",
+                    t.port()
+                )),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        let inbound_clause = inbound_targets.join(" or ");
+
+        Ok(format!(
+            "(udp and outbound{exclude_clause}) or (udp and inbound and ({inbound_clause}))"
+        ))
     }
 }
 
@@ -106,9 +167,10 @@ impl Redirector for WinDivertCapture {
             return Ok(());
         }
         let filter = self.build_filter()?;
-        tracing::info!(filter = %filter, "WinDivert filter compiled");
+        tracing::info!(filter_chars = filter.len(), "WinDivert filter compiled");
+        tracing::debug!(filter = %filter, "filter expression");
 
-        let rules = self.rules.clone();
+        let resolver = self.resolver.clone();
         let flows = self.flows.clone();
         let stats = self.stats.clone();
         let running = self.running.clone();
@@ -117,7 +179,7 @@ impl Redirector for WinDivertCapture {
         let handle = std::thread::Builder::new()
             .name("windivert-capture".into())
             .spawn(move || {
-                if let Err(e) = run_capture_loop(filter, rules, flows, stats, running, flow_idle) {
+                if let Err(e) = run_capture_loop(filter, resolver, flows, stats, running, flow_idle) {
                     tracing::error!(error = ?e, "windivert capture loop exited");
                 }
             })
@@ -153,7 +215,7 @@ const PROTO_UDP: u8 = 17;
 
 fn run_capture_loop(
     filter: String,
-    rules: Vec<RedirectRule>,
+    resolver: Arc<dyn RouteResolver>,
     flows: Arc<RwLock<HashMap<u16, FlowEntry>>>,
     stats: Arc<Stats>,
     running: Arc<AtomicBool>,
@@ -167,7 +229,6 @@ fn run_capture_loop(
     let mut last_reap = Instant::now();
 
     while running.load(Ordering::Relaxed) {
-        // Periodic flow expiry
         if last_reap.elapsed() > Duration::from_secs(15) {
             reap_flows(&flows, flow_idle);
             last_reap = Instant::now();
@@ -182,13 +243,12 @@ fn run_capture_loop(
         };
 
         let outbound = packet.address.outbound();
-        let data = packet.data.to_vec(); // own it so we can modify
+        let data = packet.data.to_vec();
 
-        let modified = match process_packet(&data, outbound, &rules, &flows) {
+        let modified = match process_packet(&data, outbound, &*resolver, &flows) {
             Some(m) => m,
             None => {
                 stats.dropped_unparseable.fetch_add(1, Ordering::Relaxed);
-                // Pass through unmodified — return original packet
                 if let Err(e) = divert.send(&packet) {
                     tracing::trace!(error = ?e, "passthrough send failed");
                 }
@@ -196,7 +256,6 @@ fn run_capture_loop(
             }
         };
 
-        // Replace packet data with our modified version
         packet.data = Cow::Owned(modified);
         if let Err(e) = packet.recalculate_checksums(ChecksumFlags::default()) {
             tracing::warn!(error = ?e, "checksum recalc failed");
@@ -219,83 +278,82 @@ fn run_capture_loop(
 
 /// Parse + apply DNAT to a single packet. Returns the modified bytes (or None
 /// if we couldn't make sense of the packet — caller should pass-through).
-///
-/// IPv4 only for now. Assumes no IP options (IHL == 5, fixed 20-byte header).
 fn process_packet(
     data: &[u8],
     outbound: bool,
-    rules: &[RedirectRule],
+    resolver: &dyn RouteResolver,
     flows: &Arc<RwLock<HashMap<u16, FlowEntry>>>,
 ) -> Option<Vec<u8>> {
-    if data.len() < 28 { return None; } // need at least IP+UDP headers
+    if data.len() < 28 {
+        return None;
+    }
     let version = data[0] >> 4;
-    if version != IPV4_VERSION { return None; }
+    if version != IPV4_VERSION {
+        return None;
+    }
     let ihl = (data[0] & 0x0F) as usize;
-    if ihl < 5 { return None; }
+    if ihl < 5 {
+        return None;
+    }
     let ip_header_len = ihl * 4;
-    if data.len() < ip_header_len + 8 { return None; }
+    if data.len() < ip_header_len + 8 {
+        return None;
+    }
 
     let proto = data[9];
-    if proto != PROTO_TCP && proto != PROTO_UDP { return None; }
+    if proto != PROTO_TCP && proto != PROTO_UDP {
+        return None;
+    }
+    let proto_enum = if proto == PROTO_TCP { Protocol::Tcp } else { Protocol::Udp };
 
     let mut out = data.to_vec();
-
-    let src_ip = Ipv4Addr::new(out[12], out[13], out[14], out[15]);
     let dst_ip = Ipv4Addr::new(out[16], out[17], out[18], out[19]);
     let src_port = u16::from_be_bytes([out[ip_header_len], out[ip_header_len + 1]]);
     let dst_port = u16::from_be_bytes([out[ip_header_len + 2], out[ip_header_len + 3]]);
 
     if outbound {
-        // Find matching rule
-        let rule = rules.iter().find(|r| {
-            let want_proto = match r.protocol {
-                Protocol::Tcp => PROTO_TCP,
-                Protocol::Udp => PROTO_UDP,
-            };
-            proto == want_proto
-                && IpAddr::V4(dst_ip) == r.dst_ip
-                && dst_port >= r.dst_port_lo
-                && dst_port <= r.dst_port_hi
-        })?;
-
-        let new_dst_ip = match rule.redirect_to_ip {
+        let dst = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
+        let action = resolver.resolve(dst, proto_enum);
+        let RouteAction::RewriteTo(target) = action else {
+            return None; // passthrough — caller will send the original packet unchanged
+        };
+        let new_dst_ip = match target.ip() {
             IpAddr::V4(v4) => v4,
             IpAddr::V6(_) => return None,
         };
 
-        // Save flow entry for the return path
-        flows.write().insert(src_port, FlowEntry {
-            orig_dst_ip: dst_ip,
-            orig_dst_port: dst_port,
-            last_seen: Instant::now(),
-        });
+        flows.write().insert(
+            src_port,
+            FlowEntry {
+                orig_dst_ip: dst_ip,
+                orig_dst_port: dst_port,
+                redirect_target: target,
+                last_seen: Instant::now(),
+            },
+        );
 
-        // Rewrite dst
         let dst_octets = new_dst_ip.octets();
         out[16..20].copy_from_slice(&dst_octets);
-        out[ip_header_len + 2..ip_header_len + 4]
-            .copy_from_slice(&rule.redirect_to_port.to_be_bytes());
+        out[ip_header_len + 2..ip_header_len + 4].copy_from_slice(&target.port().to_be_bytes());
 
         tracing::trace!(
             src_port,
             from = %dst_ip, from_port = dst_port,
-            to = %new_dst_ip, to_port = rule.redirect_to_port,
-            "outbound redirect"
+            to = %new_dst_ip, to_port = target.port(),
+            "outbound rewrite"
         );
         Some(out)
     } else {
-        // Inbound: look up flow by dst_port (which is the game's original src_port)
+        // Inbound: src is one of our redirect targets; dst_port is the game's original src_port
         let entry = {
             let mut w = flows.write();
             let e = w.get(&dst_port).copied()?;
-            // Refresh idle timer
             if let Some(slot) = w.get_mut(&dst_port) {
                 slot.last_seen = Instant::now();
             }
             e
         };
 
-        // Rewrite src to original game server
         let src_octets = entry.orig_dst_ip.octets();
         out[12..16].copy_from_slice(&src_octets);
         out[ip_header_len..ip_header_len + 2]
@@ -305,9 +363,9 @@ fn process_packet(
             game_port = dst_port,
             response_now_appears_from = %entry.orig_dst_ip,
             from_port = entry.orig_dst_port,
+            redirect_was_to = %entry.redirect_target,
             "inbound rewrite"
         );
-        let _ = src_ip; // silence unused
         Some(out)
     }
 }

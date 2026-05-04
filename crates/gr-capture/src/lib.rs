@@ -50,6 +50,45 @@ pub struct RedirectRule {
     pub redirect_to_port: u16,
 }
 
+/// Per-packet decision returned by a [`RouteResolver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteAction {
+    /// Don't touch this packet — let it flow naturally.
+    Passthrough,
+    /// Rewrite destination to this `(ip, port)`. Bridge-side response
+    /// rewriting is handled automatically via the NAT table.
+    RewriteTo(SocketAddr),
+}
+
+use std::net::SocketAddr;
+
+/// Pluggable per-flow decision maker.
+///
+/// Called for each new outbound flow the capture loop sees. Implementations
+/// may consult the destination IP, the OS routing table, latency probes,
+/// game catalogs, etc. — gr-capture stays unaware of the policy.
+pub trait RouteResolver: Send + Sync {
+    fn resolve(&self, dst: SocketAddr, protocol: Protocol) -> RouteAction;
+}
+
+/// Trivial fixed resolver — useful for tests and the legacy per-rule mode.
+pub struct FixedResolver(pub Vec<RedirectRule>);
+
+impl RouteResolver for FixedResolver {
+    fn resolve(&self, dst: SocketAddr, protocol: Protocol) -> RouteAction {
+        for r in &self.0 {
+            if r.protocol == protocol
+                && r.dst_ip == dst.ip()
+                && dst.port() >= r.dst_port_lo
+                && dst.port() <= r.dst_port_hi
+            {
+                return RouteAction::RewriteTo(SocketAddr::new(r.redirect_to_ip, r.redirect_to_port));
+            }
+        }
+        RouteAction::Passthrough
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CaptureError {
     #[error("driver open failed: {0}")]
